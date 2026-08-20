@@ -6,9 +6,27 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
+
+// defaultAliveResendAfter bounds how long FlushAliveIPs may suppress an
+// unchanged alive-IP set before resending it anyway.
+//
+// The panel stores device state in Redis under a 300s TTL that is only
+// refreshed when a report actually carries an "alive" payload. Without a
+// periodic forced resend, a user whose IP set never changes stops being
+// reported after the first flush and silently expires out of the device
+// list — the longer a client stays connected, the more certainly it
+// disappears.
+//
+// This value MUST stay well below the panel's TTL. It also has to absorb
+// the phase offset between the report ticker (server_push_interval, 60s by
+// default) and the device-report ticker (device_report_interval, 30s), so
+// the worst-case refresh interval is roughly 2x this value's ticker
+// granularity. 120s leaves a full 2x margin against the 300s TTL.
+const defaultAliveResendAfter = 120 * time.Second
 
 // snapshot is an immutable point-in-time view of tracker state.
 // It is swapped atomically so readers never block writers.
@@ -49,19 +67,24 @@ type Tracker struct {
 	// Readers load this pointer without any lock.
 	live atomic.Pointer[snapshot]
 
-	// aliveIPsBuf is a reusable buffer for FlushAliveIPs output.
-	// Avoids allocating a new map+slice every 60s.
-	aliveIPsBuf map[int][]string
-
 	// lastAliveIPsHash detects changes to avoid duplicate reports.
 	lastAliveIPsHash string
+
+	// lastAliveFlush records when FlushAliveIPs last handed out a payload.
+	// Used to force a periodic resend so the panel's TTL keeps getting
+	// refreshed even while the IP set is unchanged.
+	lastAliveFlush time.Time
+
+	// aliveResendAfter is the maximum suppression window for an unchanged
+	// alive-IP set. See defaultAliveResendAfter.
+	aliveResendAfter time.Duration
 }
 
 func New() *Tracker {
 	t := &Tracker{
-		lastSeen:       make(map[int][2]int64),
-		pendingTraffic: make(map[int][2]int64),
-		aliveIPsBuf:    make(map[int][]string),
+		lastSeen:         make(map[int][2]int64),
+		pendingTraffic:   make(map[int][2]int64),
+		aliveResendAfter: defaultAliveResendAfter,
 	}
 	// Publish initial empty snapshot.
 	t.live.Store(&snapshot{
@@ -159,43 +182,40 @@ func (t *Tracker) HasTraffic() bool {
 	return len(t.pendingTraffic) > 0
 }
 
-// FlushAliveIPs returns per-user alive IPs.
-// Reuses internal buffer. Returns nil if unchanged.
+// FlushAliveIPs returns per-user alive IPs, or nil when the set is unchanged
+// and the forced-resend window has not elapsed yet.
+//
+// The returned map is freshly allocated and owned by the caller: callers hand
+// it to a background goroutine for JSON serialization, so it must not alias
+// any state that a later flush would mutate.
 func (t *Tracker) FlushAliveIPs() map[int][]string {
 	s := t.live.Load()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Calculate hash of current aliveIPs
 	currentHash := calcAliveIPsHash(s.aliveIPs)
 
-	// If no changes, return nil to avoid duplicate reporting
-	if currentHash == t.lastAliveIPsHash {
+	// Unchanged set: normally suppressed as a duplicate, but resend once the
+	// window elapses so the panel keeps refreshing its device-state TTL.
+	if currentHash == t.lastAliveIPsHash &&
+		time.Since(t.lastAliveFlush) < t.aliveResendAfter {
 		return nil
 	}
 
 	t.lastAliveIPsHash = currentHash
+	t.lastAliveFlush = time.Now()
 
-	// Clear old buffer entries.
-	for k := range t.aliveIPsBuf {
-		delete(t.aliveIPsBuf, k)
-	}
-
-	// Fill buffer from snapshot.
+	out := make(map[int][]string, len(s.aliveIPs))
 	for uid, ips := range s.aliveIPs {
-		buf := t.aliveIPsBuf[uid]
-		if buf == nil {
-			buf = make([]string, 0, len(ips))
-		}
-		buf = buf[:0]
+		list := make([]string, 0, len(ips))
 		for ip := range ips {
-			buf = append(buf, ip)
+			list = append(list, ip)
 		}
-		t.aliveIPsBuf[uid] = buf
+		out[uid] = list
 	}
 
-	return t.aliveIPsBuf
+	return out
 }
 
 // calcAliveIPsHash computes a deterministic hash for change detection.
@@ -243,29 +263,17 @@ func (t *Tracker) CurrentOnline() map[int]int {
 	return cp
 }
 
-// RestoreAliveIPs merges alive IPs back in (used when push to panel fails).
-// Note: this operates on the buffer, which will be overwritten next Process().
-func (t *Tracker) RestoreAliveIPs(data map[int][]string) {
+// InvalidateAliveIPs clears the dedup state so the next FlushAliveIPs resends,
+// used when a push to the panel fails.
+//
+// Alive IPs are state, not a delta: every Process tick republishes the kernel's
+// current set into the live snapshot, so a failed report needs no data restored
+// — only the duplicate-suppression lifted.
+func (t *Tracker) InvalidateAliveIPs() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	for uid, ipList := range data {
-		ips := t.aliveIPsBuf[uid]
-		if ips == nil {
-			ips = make([]string, 0, len(ipList))
-		}
-		// Use map for O(n) dedup instead of O(n²) linear search
-		existMap := make(map[string]struct{}, len(ips)+len(ipList))
-		for _, existing := range ips {
-			existMap[existing] = struct{}{}
-		}
-		for _, ip := range ipList {
-			if _, exists := existMap[ip]; !exists {
-				ips = append(ips, ip)
-				existMap[ip] = struct{}{}
-			}
-		}
-		t.aliveIPsBuf[uid] = ips
-	}
+	t.lastAliveIPsHash = ""
+	t.lastAliveFlush = time.Time{}
+	t.mu.Unlock()
 }
 
 // LogStats logs current tracking statistics.

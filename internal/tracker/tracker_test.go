@@ -2,6 +2,7 @@ package tracker
 
 import (
 	"testing"
+	"time"
 )
 
 func TestProcess_InitialTraffic(t *testing.T) {
@@ -168,6 +169,103 @@ func TestFlushAliveIPs(t *testing.T) {
 	flushed2 := tr.FlushAliveIPs()
 	if flushed2 != nil {
 		t.Errorf("expected nil on duplicate flush, got %v", flushed2)
+	}
+}
+
+func TestFlushAliveIPs_ResendsAfterWindow(t *testing.T) {
+	tr := New()
+	aliveIPs := map[int]map[string]bool{
+		1: {"1.1.1.1": true},
+	}
+	tr.Process(map[int][2]int64{1: {100, 200}}, aliveIPs, 1)
+
+	if tr.FlushAliveIPs() == nil {
+		t.Fatal("first flush should return data")
+	}
+	if tr.FlushAliveIPs() != nil {
+		t.Fatal("second flush should be suppressed as duplicate")
+	}
+
+	// Backdate the last flush past the resend window. The IP set is still
+	// unchanged, but the panel's TTL needs refreshing.
+	tr.mu.Lock()
+	tr.lastAliveFlush = time.Now().Add(-tr.aliveResendAfter - time.Second)
+	tr.mu.Unlock()
+
+	forced := tr.FlushAliveIPs()
+	if forced == nil {
+		t.Fatal("flush after resend window should return data")
+	}
+	if len(forced[1]) != 1 {
+		t.Errorf("user 1 IPs: got %d, want 1", len(forced[1]))
+	}
+
+	// The forced resend restarts the window.
+	if tr.FlushAliveIPs() != nil {
+		t.Error("flush right after forced resend should be suppressed")
+	}
+}
+
+func TestFlushAliveIPs_ReturnsIndependentCopy(t *testing.T) {
+	tr := New()
+	tr.Process(map[int][2]int64{1: {100, 200}}, map[int]map[string]bool{
+		1: {"1.1.1.1": true},
+	}, 1)
+
+	first := tr.FlushAliveIPs()
+	if first == nil {
+		t.Fatal("first flush should return data")
+	}
+
+	// Mutating the returned map must not corrupt later flushes: callers hand
+	// it to a goroutine that serializes it concurrently with the next flush.
+	first[1][0] = "mutated"
+	first[99] = []string{"injected"}
+
+	tr.Process(map[int][2]int64{1: {150, 250}}, map[int]map[string]bool{
+		1: {"1.1.1.1": true, "2.2.2.2": true},
+	}, 2)
+
+	second := tr.FlushAliveIPs()
+	if second == nil {
+		t.Fatal("changed IP set should flush")
+	}
+	if _, leaked := second[99]; leaked {
+		t.Error("second flush aliased the first flush's map")
+	}
+	if len(second[1]) != 2 {
+		t.Fatalf("user 1 IPs: got %d, want 2", len(second[1]))
+	}
+	for _, ip := range second[1] {
+		if ip == "mutated" {
+			t.Error("second flush shares slice storage with the first")
+		}
+	}
+}
+
+func TestInvalidateAliveIPs(t *testing.T) {
+	tr := New()
+	tr.Process(map[int][2]int64{1: {100, 200}}, map[int]map[string]bool{
+		1: {"1.1.1.1": true},
+	}, 1)
+
+	if tr.FlushAliveIPs() == nil {
+		t.Fatal("first flush should return data")
+	}
+	if tr.FlushAliveIPs() != nil {
+		t.Fatal("second flush should be suppressed as duplicate")
+	}
+
+	// A failed report lifts the suppression without needing data restored:
+	// the live snapshot still holds the kernel's current set.
+	tr.InvalidateAliveIPs()
+
+	retried := tr.FlushAliveIPs()
+	if retried == nil {
+		t.Fatal("flush after invalidate should return data")
+	}
+	if len(retried[1]) != 1 {
+		t.Errorf("user 1 IPs: got %d, want 1", len(retried[1]))
 	}
 }
 
